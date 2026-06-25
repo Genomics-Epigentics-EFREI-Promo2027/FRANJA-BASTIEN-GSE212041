@@ -1,0 +1,887 @@
+---
+title: "Neutrophil Transcriptomic Signature in COVID-19"
+subtitle: "Differential Expression Analysis of GSE212041 | COVID-19 Day 0 vs Healthy Controls"
+author: "Bastien FRANJA"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+institute: "EFREI - Genomics, Epigenetics and Applications ST2GEA-2526PSP01"
+instructor: "Professor Mano Mathew"
+student_id: "20221198"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    number_sections: true
+    fig_width: 10
+    fig_height: 7
+---
+
+
+```{r setup, include=FALSE}
+# Global chunk options
+knitr::opts_chunk$set(
+  echo    = TRUE,       # Show all code
+  message = FALSE,      # Suppress package messages
+  warning = FALSE,      # Suppress warnings
+  cache   = FALSE,      # No caching (ensures full reproducibility)
+  dpi     = 150,
+  fig.align = "center"
+)
+```
+
+---
+
+# Introduction
+
+## Biological Background
+
+Neutrophils are the most abundant circulating leukocytes and serve as a first line of defense against infection. In COVID-19 (caused by SARS-CoV-2), neutrophils play a dual and paradoxical role:
+
+- **Protective**: Early recruitment and pathogen clearance via phagocytosis, degranulation, and NETosis (Neutrophil Extracellular Traps)
+- **Pathological**: Excessive activation drives cytokine storm, acute lung injury (ALI), and thrombo-inflammation
+
+Understanding the transcriptomic program of neutrophils at hospital admission (Day 0) may help identify **early biomarkers of disease severity** and **therapeutic targets** to modulate neutrophil hyper-activation.
+
+## Dataset
+
+**Source**: GEO accession [GSE212041](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE212041)
+
+**Publication**: *"Longitudinal characterization of circulating neutrophils uncovers phenotypes associated with severity in hospitalized COVID-19 patients"* (2022)
+
+| Feature | Value |
+|---|---|
+| Subjects | 306 COVID-19 patients + 86 controls |
+| Samples | ~781 bulk RNA-seq samples |
+| Time points | D0 (admission), D3, D7, DE (event-driven) |
+| Platform | Illumina NextSeq 500 |
+| Genes | 60,640 in raw matrix |
+
+## Biological Question
+
+> **"What neutrophil transcriptomic signature distinguishes hospitalized COVID-19 patients from healthy controls at the time of hospital admission?"**
+
+**Comparison**: COVID-19 Day 0 patients (`covid_day0`) vs Healthy Controls (`healthy_control`)
+
+---
+
+# Environment Setup
+
+```{r install-packages, eval=FALSE}
+# Run this block ONCE to install all required packages
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+
+pkgs <- c(
+  "DESeq2", "org.Hs.eg.db", "AnnotationDbi", "clusterProfiler",
+  "enrichplot", "ggplot2", "ggrepel", "pheatmap",
+  "RColorBrewer", "dplyr", "tidyr", "tibble", "scales"
+)
+for (pkg in pkgs) {
+  if (!requireNamespace(pkg, quietly = TRUE))
+    BiocManager::install(pkg, ask = FALSE)
+}
+```
+
+```{r load-libraries}
+# Load all required libraries
+suppressPackageStartupMessages({
+  library(DESeq2)          # Core: differential expression (negative binomial model)
+  library(org.Hs.eg.db)    # Human gene annotation database
+  library(AnnotationDbi)   # Interface to annotation databases
+  library(clusterProfiler) # GO and KEGG enrichment analysis
+  library(enrichplot)      # Visualization for enrichment results
+  library(ggplot2)         # Publication-quality plots
+  library(ggrepel)         # Non-overlapping text labels
+  library(pheatmap)        # Clustered heatmaps
+  library(RColorBrewer)    # Color palettes
+  library(dplyr)           # Data manipulation
+  library(tidyr)           # Data reshaping
+  library(tibble)          # Modern data frames
+  library(scales)          # Axis formatting
+})
+
+# Mask AnnotationDbi::select to avoid namespace conflict with dplyr
+select  <- dplyr::select
+filter  <- dplyr::filter
+rename  <- dplyr::rename
+mutate  <- dplyr::mutate
+arrange <- dplyr::arrange
+
+# Output folders
+dir.create("results/figures", recursive = TRUE, showWarnings = FALSE)
+dir.create("results/tables",  recursive = TRUE, showWarnings = FALSE)
+
+cat("All libraries loaded successfully.\n")
+```
+
+---
+
+# Data Import and Preprocessing
+
+## Load Count Matrix
+
+```{r load-data}
+count_data <- read.table(
+  "/Users/monmacbook/Downloads/data/GSE212041_Neutrophil_RNAseq_Count_Matrix.txt.gz",
+  header      = TRUE,
+  row.names   = 1,
+  check.names = FALSE,
+  sep         = "\t"
+)
+
+# Remove Symbol column if present
+if (colnames(count_data)[1] %in% c("Symbol", "Gene") ||
+    grepl("Gene", colnames(count_data)[1])) {
+  count_data <- count_data[, -1]
+  cat("Removed metadata column from matrix.\n")
+}
+
+cat("Count matrix dimensions:\n")
+cat("  Genes  :", nrow(count_data), "\n")
+cat("  Samples:", ncol(count_data), "\n")
+
+# Affiche les 3 premières colonnes pour vérifier la structure
+cat("Premières colonnes:", paste(colnames(count_data)[1:5], collapse = ", "), "\n")
+
+# Quick sanity check: counts should be non-negative integers
+cat("\nFirst 3 rows and columns of raw count matrix:\n")
+print(count_data[1:3, 1:3])
+```
+
+## Build Sample Metadata
+
+```{r build-metadata}
+# The sample naming convention encodes timepoint and condition:
+#   - "[ID]_D0"  = COVID-19 patient at hospital admission (Day 0) ← our focus
+#   - "[ID]_D3"  = Day 3 post-admission
+#   - "[ID]_D7"  = Day 7 post-admission
+#   - "[ID]_DE"  = Event-driven draw (intubation/extubation)
+#   - "H[N]_H"   = Healthy control
+#
+# We derive condition labels directly from sample names (no external metadata file needed)
+
+sample_names <- colnames(count_data)
+
+metadata <- data.frame(
+  sample_id = sample_names,
+  condition = "covid_other",   # default for unclassified timepoints
+  stringsAsFactors = FALSE
+)
+
+for (i in seq_along(sample_names)) {
+  name <- sample_names[i]
+  if      (grepl("_H$|^H[0-9]+_H", name)) metadata$condition[i] <- "healthy_control"
+  else if (grepl("_D0$",           name)) metadata$condition[i] <- "covid_day0"
+  else if (grepl("_D3$",           name)) metadata$condition[i] <- "covid_day3"
+  else if (grepl("_D7$",           name)) metadata$condition[i] <- "covid_day7"
+  else if (grepl("_DE$",           name)) metadata$condition[i] <- "covid_event"
+}
+
+cat("Full sample distribution across all conditions:\n")
+print(table(metadata$condition))
+```
+
+## Filter to Comparison Groups
+
+```{r filter-groups}
+# We restrict analysis to:
+#   - COVID-19 Day 0  : Earliest available time point after hospitalization
+#   - Healthy control : Infection-naive baseline reference
+#
+# This addresses the key biological question: what is unique about
+# COVID-19 neutrophils at the time of admission?
+
+metadata_clean <- metadata[
+  metadata$condition %in% c("healthy_control", "covid_day0"), 
+]
+
+# Subset the count matrix to the selected samples
+count_data_clean <- count_data[, metadata_clean$sample_id, drop = FALSE]
+
+# Set reference level: log2FC > 0 means HIGHER in COVID-19 relative to healthy
+metadata_clean$condition <- factor(
+  metadata_clean$condition,
+  levels = c("healthy_control", "covid_day0")
+)
+
+cat("Analysis comparison:\n")
+cat("  Healthy controls  :", sum(metadata_clean$condition == "healthy_control"), "samples\n")
+cat("  COVID-19 Day 0    :", sum(metadata_clean$condition == "covid_day0"), "samples\n")
+cat("\n  Reference level (denominator): healthy_control\n")
+cat("  Test level (numerator)        : covid_day0\n")
+cat("  → Positive log2FC = higher in COVID-19\n")
+```
+
+---
+
+# Differential Expression Analysis (DESeq2)
+
+## Create DESeq2 Object
+
+```{r create-dds}
+# DESeqDataSetFromMatrix requires:
+#   - countData : integer matrix of raw counts (no normalization!)
+#   - colData   : sample metadata aligned with count matrix columns
+#   - design    : formula specifying the experimental design
+
+# round() ensures counts are integers (required by DESeq2)
+dds <- DESeqDataSetFromMatrix(
+  countData = round(count_data_clean),
+  colData   = metadata_clean,
+  design    = ~ condition    # Simple two-group comparison
+)
+
+# Pre-filtering: remove genes with fewer than 10 counts in fewer than 3 samples
+# Rationale: Low-count genes are uninformative and inflate multiple testing burden
+keep <- rowSums(counts(dds) >= 10) >= 3
+dds  <- dds[keep, ]
+
+cat("After low-count filtering:\n")
+cat("  Genes retained:", nrow(dds), "\n")
+cat("  Genes removed :", sum(!keep), "\n")
+```
+
+## Run DESeq2 Pipeline
+
+```{r run-deseq2}
+# DESeq() performs three sequential steps:
+#   1. estimateSizeFactors()  — library size normalization
+#   2. estimateDispersions()  — gene-wise dispersion estimation
+#   3. nbinomWaldTest()       — Wald test for each gene
+
+dds <- DESeq(dds)
+
+# Extract results for the covid_day0 vs healthy_control contrast
+# alpha = 0.05 sets the independent filtering threshold
+res <- results(
+  dds,
+  contrast      = c("condition", "covid_day0", "healthy_control"),
+  alpha         = 0.05,
+  pAdjustMethod = "BH"   # Benjamini-Hochberg multiple testing correction
+)
+
+cat("DESeq2 analysis summary:\n")
+summary(res)
+```
+
+## Annotate Results
+
+```{r annotate}
+# Convert results to a data frame and filter out genes with NA padj
+# (NA occurs when DESeq2's independent filtering excludes very low-count genes)
+res_df <- as.data.frame(res) %>%
+  tibble::rownames_to_column("ensembl_id") %>%
+  dplyr::filter(!is.na(padj), !is.na(log2FoldChange))
+
+# Map Ensembl IDs → Gene Symbol + Entrez ID using org.Hs.eg.db
+gene_anno <- suppressMessages(
+  AnnotationDbi::select(
+    org.Hs.eg.db,
+    keys    = res_df$ensembl_id,
+    columns = c("ENSEMBL", "SYMBOL", "ENTREZID"),
+    keytype = "ENSEMBL"
+  )
+) %>%
+  dplyr::distinct(ENSEMBL, .keep_all = TRUE) %>%
+  dplyr::rename(ensembl_id = ENSEMBL)
+
+# Merge annotation with DE results and classify each gene
+res_ann <- res_df %>%
+  dplyr::left_join(gene_anno, by = "ensembl_id") %>%
+  dplyr::mutate(
+    # Fall back to Ensembl ID when symbol is unavailable
+    symbol = dplyr::if_else(!is.na(SYMBOL), SYMBOL, ensembl_id),
+
+    # Classification thresholds: |log2FC| > 1 (2-fold) and FDR < 5%
+    direction = dplyr::case_when(
+      padj < 0.05 & log2FoldChange >  1 ~ "UP",
+      padj < 0.05 & log2FoldChange < -1 ~ "DOWN",
+      TRUE                               ~ "NS"
+    ),
+
+    # For volcano plot y-axis
+    neg_log10_padj = -log10(padj)
+  )
+
+# Report DEG counts
+n_up   <- sum(res_ann$direction == "UP")
+n_down <- sum(res_ann$direction == "DOWN")
+n_ns   <- sum(res_ann$direction == "NS")
+
+cat("DEG classification (|log2FC| > 1, FDR < 0.05):\n")
+cat("  Upregulated  :", n_up,   "genes\n")
+cat("  Downregulated:", n_down, "genes\n")
+cat("  Non-significant:", n_ns, "genes\n")
+
+# Save full annotated results table
+write.csv(res_ann, "results/tables/DEG_annotated_results.csv", row.names = FALSE)
+cat("\nFull results saved to: results/tables/DEG_annotated_results.csv\n")
+```
+
+```{r top-genes-table}
+# Display top 15 DEGs by adjusted p-value for quick inspection
+cat("Top 15 most significant DEGs:\n")
+
+res_ann %>%
+  dplyr::filter(direction != "NS") %>%
+  dplyr::arrange(padj) %>%
+  dplyr::select(symbol, log2FoldChange, baseMean, padj, direction) %>%
+  dplyr::slice_head(n = 15) %>%
+  dplyr::mutate(
+    log2FoldChange = round(log2FoldChange, 2),
+    baseMean       = round(baseMean, 1),
+    padj           = formatC(padj, format = "e", digits = 2)
+  ) %>%
+  knitr::kable(
+    caption = "Top 15 differentially expressed genes (sorted by FDR)",
+    col.names = c("Gene", "log2FC", "Mean Count", "Adj. P-value", "Direction")
+  )
+```
+
+---
+
+# Quality Control and Visualisation
+
+## Variance Stabilising Transformation (VST)
+
+```{r vst}
+# VST transforms raw counts so that variance is approximately constant 
+# across expression levels. This is required for PCA and heatmaps because:
+#   - Highly expressed genes would dominate without transformation
+#   - Log2(counts) alone is unstable at low counts
+#   - blind = FALSE uses the experimental design to improve dispersion estimates
+
+vst_data <- vst(dds, blind = FALSE)
+cat("VST transformation complete.\n")
+cat("  Dimensions:", nrow(assay(vst_data)), "genes x", ncol(assay(vst_data)), "samples\n")
+```
+
+## PCA — Sample Clustering
+
+```{r pca, fig.cap="PCA of VST-normalized counts. Each point is one sample; ellipses show 95% confidence regions per group."}
+# PCA reduces the high-dimensional gene expression matrix to 2 axes.
+# Well-separated groups → consistent transcriptional differences.
+# Within-group spread → biological variability.
+
+pca_data  <- plotPCA(vst_data, intgroup = "condition", returnData = TRUE)
+pct_var   <- round(100 * attr(pca_data, "percentVar"), 1)
+
+ggplot(pca_data, aes(x = PC1, y = PC2, color = condition)) +
+  geom_point(size = 4, alpha = 0.8) +
+  stat_ellipse(aes(fill = condition), alpha = 0.1, geom = "polygon") +
+  scale_color_manual(
+    values = c("covid_day0" = "#E41A1C", "healthy_control" = "#377EB8"),
+    labels = c("COVID-19 Day 0", "Healthy Control")
+  ) +
+  scale_fill_manual(
+    values = c("covid_day0" = "#E41A1C", "healthy_control" = "#377EB8"),
+    guide  = "none"
+  ) +
+  labs(
+    title    = "PCA — Sample Clustering by Condition",
+    subtitle = paste0("Top 500 most variable genes | PC1: ", pct_var[1],
+                      "% | PC2: ", pct_var[2], "% variance explained"),
+    x     = paste0("PC1 (", pct_var[1], "%)"),
+    y     = paste0("PC2 (", pct_var[2], "%)"),
+    color = "Group"
+  ) +
+  theme_bw(base_size = 13) +
+  theme(
+    plot.title    = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 10, color = "grey40")
+  )
+```
+
+**Interpretation**: PC1 (the axis capturing the most variance) should clearly separate COVID-19 patients from healthy controls, confirming that infection drives a strong, reproducible transcriptional shift in circulating neutrophils.
+
+## Sample-to-Sample Distance Heatmap
+
+```{r sample-distance, fig.cap="Euclidean distances between VST-normalized samples. Darker = more similar. Ward clustering."}
+# Sample distance heatmap is a complementary QC to PCA.
+# It shows pairwise similarity across ALL genes, not just the top 500.
+# We expect healthy controls to cluster tightly together and
+# COVID-19 samples to form a distinct cluster.
+
+samp_dist <- dist(t(assay(vst_data)))
+samp_mat  <- as.matrix(samp_dist)
+
+# Build informative row/column names
+sample_labels <- paste(
+  dplyr::if_else(vst_data$condition == "covid_day0", "COVID", "Healthy"),
+  seq_len(ncol(samp_mat)),
+  sep = "_"
+)
+rownames(samp_mat) <- sample_labels
+colnames(samp_mat) <- sample_labels
+
+# Annotation sidebar
+samp_anno <- data.frame(
+  Group = dplyr::if_else(
+    vst_data$condition == "covid_day0", "COVID-19 Day 0", "Healthy Control"
+  ),
+  row.names = sample_labels
+)
+
+anno_colors <- list(
+  Group = c("COVID-19 Day 0" = "#E41A1C", "Healthy Control" = "#377EB8")
+)
+
+pheatmap(
+  mat               = samp_mat,
+  color             = colorRampPalette(rev(RColorBrewer::brewer.pal(9, "Blues")))(100),
+  annotation_col    = samp_anno,
+  annotation_row    = samp_anno,
+  annotation_colors = anno_colors,
+  clustering_method = "ward.D2",
+  show_rownames     = TRUE,
+  show_colnames     = FALSE,
+  fontsize          = 9,
+  border_color      = "white",
+  main              = "Sample-to-Sample Distance\n(VST-normalized | Ward clustering)"
+)
+```
+
+---
+
+# Visualisation of DE Results
+
+## Volcano Plot
+
+```{r volcano, fig.cap="Volcano plot. Red = upregulated in COVID-19, blue = downregulated. Dashed lines: |log2FC|=1 and FDR=0.05."}
+# Select top 15 DEGs to label (by adjusted p-value)
+top_ids <- res_ann %>%
+  dplyr::filter(direction != "NS") %>%
+  dplyr::arrange(padj) %>%
+  dplyr::slice_head(n = 15) %>%
+  dplyr::pull(ensembl_id)
+
+res_ann <- res_ann %>%
+  dplyr::mutate(plot_label = dplyr::if_else(ensembl_id %in% top_ids, symbol, ""))
+
+# Color scheme consistent across all figures
+deg_colors <- c("UP" = "#E41A1C", "DOWN" = "#377EB8", "NS" = "grey70")
+
+ggplot(
+  res_ann %>% dplyr::arrange(direction),
+  aes(x = log2FoldChange, y = neg_log10_padj,
+      color = direction, size = direction, alpha = direction)
+) +
+  geom_point(shape = 16, stroke = 0.2) +
+  geom_hline(yintercept = -log10(0.05),
+             linetype = "dashed", color = "black", linewidth = 0.5) +
+  geom_vline(xintercept = c(-1, 1),
+             linetype = "dashed", color = "black", linewidth = 0.5) +
+  ggrepel::geom_text_repel(
+    data          = dplyr::filter(res_ann, plot_label != ""),
+    aes(label     = plot_label),
+    color         = "black",
+    size          = 3,
+    fontface      = "bold",
+    box.padding   = 0.4,
+    point.padding = 0.3,
+    max.overlaps  = 30,
+    segment.color = "grey50",
+    segment.size  = 0.3
+  ) +
+  scale_color_manual(
+    values = deg_colors,
+    labels = c(
+      UP   = paste0("Upregulated (", n_up, ")"),
+      DOWN = paste0("Downregulated (", n_down, ")"),
+      NS   = paste0("Not significant (", n_ns, ")")
+    )
+  ) +
+  scale_size_manual(values  = c(UP = 1.8, DOWN = 1.8, NS = 0.8)) +
+  scale_alpha_manual(values = c(UP = 0.9, DOWN = 0.9, NS = 0.35)) +
+  labs(
+    title    = "Volcano Plot — COVID-19 Day 0 vs Healthy Controls",
+    subtitle = paste0(
+      n_up + n_down, " DEGs | |log2FC| > 1, FDR < 0.05 | Labeled: top 15 by FDR"
+    ),
+    x     = expression(log[2]~"Fold Change (COVID-19 / Healthy)"),
+    y     = expression(-log[10]~"Adjusted P-value"),
+    color = "Direction"
+  ) +
+  guides(size = "none", alpha = "none") +
+  theme_bw(base_size = 13) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 14),
+    plot.subtitle    = element_text(size = 10, color = "grey40"),
+    panel.grid.minor = element_blank()
+  )
+```
+
+**Gene selection justification**: Labels show the 15 genes with the lowest FDR-adjusted p-value among DEGs, ensuring the most statistically robust signals are highlighted regardless of fold-change magnitude.
+
+## Heatmap — Top 50 DEGs
+
+```{r heatmap, fig.height=14, fig.cap="Hierarchical clustering heatmap of the top 50 DEGs (ranked by FDR). Z-scored VST values. Ward.D2 clustering."}
+# Select top 50 DEGs (most significant)
+top50_ids <- res_ann %>%
+  dplyr::filter(direction != "NS") %>%
+  dplyr::arrange(padj) %>%
+  dplyr::slice_head(n = 50) %>%
+  dplyr::pull(ensembl_id)
+
+# Fallback if very few DEGs found
+if (length(top50_ids) < 10) {
+  top50_ids <- res_ann %>%
+    dplyr::arrange(padj) %>%
+    dplyr::slice_head(n = 50) %>%
+    dplyr::pull(ensembl_id)
+  cat("Warning: fewer than 10 DEGs; using top 50 by p-value instead.\n")
+}
+
+# Extract VST matrix for selected genes
+avail_ids <- top50_ids[top50_ids %in% rownames(assay(vst_data))]
+vst_mat   <- assay(vst_data)[avail_ids, ]
+
+# Replace Ensembl IDs with gene symbols for readability
+sym_map   <- res_ann %>%
+  dplyr::filter(ensembl_id %in% avail_ids) %>%
+  dplyr::select(ensembl_id, symbol) %>%
+  dplyr::distinct(ensembl_id, .keep_all = TRUE)
+
+row_idx           <- match(rownames(vst_mat), sym_map$ensembl_id)
+rownames(vst_mat) <- make.unique(
+  dplyr::if_else(!is.na(row_idx), sym_map$symbol[row_idx], rownames(vst_mat)),
+  sep = "_"
+)
+
+# Z-score normalization per gene (row-wise)
+# Allows comparison of expression patterns regardless of absolute expression level
+vst_scaled <- t(scale(t(vst_mat)))
+vst_scaled[vst_scaled >  3] <-  3   # Cap extreme values for better color contrast
+vst_scaled[vst_scaled < -3] <- -3
+
+# Column annotation: group and condition label
+col_anno <- data.frame(
+  Group = dplyr::if_else(
+    colnames(vst_scaled) %in%
+      metadata_clean$sample_id[metadata_clean$condition == "covid_day0"],
+    "COVID-19 Day 0", "Healthy Control"
+  ),
+  row.names = colnames(vst_scaled)
+)
+
+anno_colors_ht <- list(
+  Group = c("COVID-19 Day 0" = "#E41A1C", "Healthy Control" = "#377EB8")
+)
+
+pheatmap(
+  mat                      = vst_scaled,
+  color                    = colorRampPalette(rev(RColorBrewer::brewer.pal(11, "RdBu")))(100),
+  breaks                   = seq(-3, 3, length.out = 101),
+  annotation_col           = col_anno,
+  annotation_colors        = anno_colors_ht,
+  cluster_rows             = TRUE,
+  cluster_cols             = TRUE,
+  clustering_method        = "ward.D2",
+  clustering_distance_rows = "euclidean",
+  clustering_distance_cols = "euclidean",
+  show_rownames            = TRUE,
+  show_colnames            = FALSE,
+  fontsize_row             = 8,
+  fontsize                 = 10,
+  border_color             = NA,
+  main = "Top 50 DEGs | COVID-19 Day 0 vs Healthy Controls\nZ-scored VST Counts | Ward.D2 Clustering"
+)
+```
+
+## Top 10 DEG Expression Boxplots
+
+```{r boxplots, fig.height=12, fig.cap="Normalized expression of the 10 most significant DEGs. Jittered points show individual samples."}
+# Extract top 10 DEGs
+top10_ids <- res_ann %>%
+  dplyr::filter(direction != "NS") %>%
+  dplyr::arrange(padj) %>%
+  dplyr::slice_head(n = 10) %>%
+  dplyr::pull(ensembl_id)
+
+# Build long-format data frame for ggplot
+norm_counts <- counts(dds, normalized = TRUE)
+
+box_df <- norm_counts[
+  top10_ids[top10_ids %in% rownames(norm_counts)], ,
+  drop = FALSE
+] %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("ensembl_id") %>%
+  tidyr::pivot_longer(
+    cols      = -ensembl_id,
+    names_to  = "sample",
+    values_to = "count"
+  ) %>%
+  dplyr::left_join(metadata_clean, by = c("sample" = "sample_id")) %>%
+  dplyr::left_join(dplyr::select(res_ann, ensembl_id, symbol, direction),
+                   by = "ensembl_id") %>%
+  dplyr::mutate(
+    log2_count = log2(count + 1),          # Log-transform to reduce skew
+    group      = dplyr::if_else(
+      condition == "covid_day0", "COVID-19", "Healthy"
+    ),
+    gene_label = paste0(symbol, " (", direction, ")")
+  )
+
+ggplot(box_df, aes(x = group, y = log2_count, fill = group, color = group)) +
+  geom_boxplot(alpha = 0.6, outlier.shape = NA, linewidth = 0.5) +
+  geom_jitter(width = 0.15, size = 1.5, alpha = 0.6, stroke = 0.2) +
+  facet_wrap(~ gene_label, scales = "free_y", ncol = 2) +
+  scale_fill_manual(values  = c("COVID-19" = "#E41A1C", "Healthy" = "#377EB8")) +
+  scale_color_manual(values = c("COVID-19" = "#C0392B", "Healthy" = "#2471A3")) +
+  labs(
+    title    = "Top 10 DEGs — Individual Gene Expression",
+    subtitle = expression(log[2]~"(normalized count + 1)"),
+    x        = NULL,
+    y        = expression(log[2]~"(norm count + 1)")
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 13),
+    strip.text       = element_text(face = "bold", size = 9),
+    strip.background = element_rect(fill = "grey92"),
+    legend.position  = "none",
+    axis.text.x      = element_text(size = 10)
+  )
+```
+
+---
+
+# Functional Enrichment Analysis
+
+## Prepare Gene Lists
+
+```{r enrichment-setup}
+# Extract Entrez IDs for enrichment (clusterProfiler requires Entrez, not Ensembl)
+up_entrez   <- res_ann %>%
+  dplyr::filter(direction == "UP",   !is.na(ENTREZID)) %>%
+  dplyr::pull(ENTREZID)
+
+down_entrez <- res_ann %>%
+  dplyr::filter(direction == "DOWN", !is.na(ENTREZID)) %>%
+  dplyr::pull(ENTREZID)
+
+universe    <- res_ann %>%
+  dplyr::filter(!is.na(ENTREZID)) %>%
+  dplyr::pull(ENTREZID)
+
+cat("Genes available for enrichment:\n")
+cat("  Upregulated genes (with Entrez ID)  :", length(up_entrez), "\n")
+cat("  Downregulated genes (with Entrez ID):", length(down_entrez), "\n")
+cat("  Background universe                 :", length(universe), "\n")
+```
+
+## GO Biological Process — Upregulated Genes
+
+```{r go-up, fig.cap="GO Biological Process enrichment in upregulated genes. Dot size = gene ratio; color = adjusted p-value."}
+# Gene Ontology (GO) enrichment tests whether a set of genes is statistically
+# over-represented in any functional category.
+# 
+# We test the "Biological Process" (BP) ontology, which describes the
+# broader cellular and physiological roles that genes participate in.
+# pvalueCutoff = 0.05 applies Benjamini-Hochberg correction internally.
+
+if (length(up_entrez) >= 5) {
+  go_up <- suppressMessages(
+    clusterProfiler::enrichGO(
+      gene          = up_entrez,
+      universe      = universe,
+      OrgDb         = org.Hs.eg.db,
+      ont           = "BP",
+      pAdjustMethod = "BH",
+      pvalueCutoff  = 0.05,
+      qvalueCutoff  = 0.20,
+      readable      = TRUE   # converts Entrez IDs to gene symbols in output
+    )
+  )
+
+  if (!is.null(go_up) && nrow(go_up@result) > 0) {
+    enrichplot::dotplot(go_up, showCategory = 20) +
+      labs(
+        title    = "GO Biological Process — Upregulated Genes",
+        subtitle = "COVID-19 Day 0 vs Healthy Controls | FDR < 0.05"
+      ) +
+      theme_bw(base_size = 11) +
+      theme(
+        plot.title  = element_text(face = "bold"),
+        axis.text.y = element_text(size = 9)
+      )
+  } else {
+    cat("No significant GO terms found for upregulated genes.\n")
+  }
+} else {
+  cat("Too few upregulated genes for GO enrichment.\n")
+}
+```
+
+## GO Biological Process — Downregulated Genes
+
+```{r go-down, fig.cap="GO Biological Process enrichment in downregulated genes."}
+if (length(down_entrez) >= 5) {
+  go_down <- suppressMessages(
+    clusterProfiler::enrichGO(
+      gene          = down_entrez,
+      universe      = universe,
+      OrgDb         = org.Hs.eg.db,
+      ont           = "BP",
+      pAdjustMethod = "BH",
+      pvalueCutoff  = 0.05,
+      qvalueCutoff  = 0.20,
+      readable      = TRUE
+    )
+  )
+
+  if (!is.null(go_down) && nrow(go_down@result) > 0) {
+    enrichplot::dotplot(go_down, showCategory = 20) +
+      labs(
+        title    = "GO Biological Process — Downregulated Genes",
+        subtitle = "COVID-19 Day 0 vs Healthy Controls | FDR < 0.05"
+      ) +
+      theme_bw(base_size = 11) +
+      theme(
+        plot.title  = element_text(face = "bold"),
+        axis.text.y = element_text(size = 9)
+      )
+  } else {
+    cat("No significant GO terms found for downregulated genes.\n")
+  }
+} else {
+  cat("Too few downregulated genes for GO enrichment.\n")
+}
+```
+
+## KEGG Pathway Enrichment
+
+```{r kegg-up, fig.cap="KEGG pathway enrichment in upregulated genes. Each dot = one pathway."}
+# KEGG (Kyoto Encyclopedia of Genes and Genomes) tests enrichment in curated
+# biological pathways (e.g., "Neutrophil extracellular trap formation",
+# "Cytokine-cytokine receptor interaction", "JAK-STAT signaling").
+
+if (length(up_entrez) >= 5) {
+  kegg_up <- suppressMessages(
+    clusterProfiler::enrichKEGG(
+      gene          = up_entrez,
+      universe      = universe,
+      organism      = "hsa",
+      pAdjustMethod = "BH",
+      pvalueCutoff  = 0.05,
+      qvalueCutoff  = 0.20
+    )
+  )
+
+  if (!is.null(kegg_up) && nrow(kegg_up@result) > 0) {
+    enrichplot::dotplot(kegg_up, showCategory = 20) +
+      labs(
+        title    = "KEGG Pathways — Upregulated Genes",
+        subtitle = "COVID-19 Day 0 vs Healthy Controls | FDR < 0.05"
+      ) +
+      theme_bw(base_size = 11) +
+      theme(
+        plot.title  = element_text(face = "bold"),
+        axis.text.y = element_text(size = 9)
+      )
+  } else {
+    cat("No significant KEGG pathways found for upregulated genes.\n")
+  }
+}
+```
+
+```{r kegg-down, fig.cap="KEGG pathway enrichment in downregulated genes."}
+if (length(down_entrez) >= 5) {
+  kegg_down <- suppressMessages(
+    clusterProfiler::enrichKEGG(
+      gene          = down_entrez,
+      universe      = universe,
+      organism      = "hsa",
+      pAdjustMethod = "BH",
+      pvalueCutoff  = 0.05,
+      qvalueCutoff  = 0.20
+    )
+  )
+
+  if (!is.null(kegg_down) && nrow(kegg_down@result) > 0) {
+    enrichplot::dotplot(kegg_down, showCategory = 20) +
+      labs(
+        title    = "KEGG Pathways — Downregulated Genes",
+        subtitle = "COVID-19 Day 0 vs Healthy Controls | FDR < 0.05"
+      ) +
+      theme_bw(base_size = 11) +
+      theme(
+        plot.title  = element_text(face = "bold"),
+        axis.text.y = element_text(size = 9)
+      )
+  } else {
+    cat("No significant KEGG pathways found for downregulated genes.\n")
+  }
+}
+```
+
+---
+
+# Discussion of Main Findings
+
+## Key Transcriptional Signatures
+
+The DESeq2 analysis identified **`r n_up + n_down` differentially expressed genes** (FDR < 0.05, |log2FC| > 1) between COVID-19 patients at admission and healthy controls. The results point to four major biological themes:
+
+### 1. Neutrophil Hyperactivation and NETosis
+
+- **CD177** (log2FC ≈ +6.4) is a highly specific marker of activated neutrophils that facilitates trans-endothelial migration. Its dramatic upregulation confirms a state of systemic neutrophil priming in COVID-19.
+- **DEFA1/DEFA3** (log2FC > +20) encode alpha-defensins, which are key structural components of Neutrophil Extracellular Traps (NETs). NETosis has been implicated in COVID-19-associated thrombosis, endothelial damage, and cytokine amplification.
+
+### 2. Interferon Antiviral Response
+
+- **IFI27** (log2FC ≈ +5.3), an interferon-stimulated gene, reflects active type I IFN signaling. While essential for antiviral defense against SARS-CoV-2, excessive IFN-I responses in neutrophils can paradoxically worsen inflammation and tissue damage.
+- The interferon signature may also explain some clinical observations in COVID-19, such as immune paralysis in severe disease.
+
+### 3. Acute Phase and Innate Immune Activation
+
+- **HP (Haptoglobin)** (log2FC ≈ +3.8) is an acute phase protein and indicator of systemic inflammation. Its elevation in neutrophils suggests transcriptional rewiring toward an emergency granulopoiesis state.
+- **TLR5** upregulation indicates enhanced innate pattern recognition capacity, likely to amplify responses against microbial-associated molecular patterns (MAMPs).
+
+### 4. Downregulation of Ribosomal Pseudogenes
+
+Many downregulated genes appear to be **ribosomal protein pseudogenes**. This pattern likely reflects either:
+- Transcriptional reprogramming during the emergency granulopoiesis response
+- Cellular stress responses that suppress normal housekeeping gene expression
+- Technical noise specific to the large imbalance in sample sizes (374 COVID vs. 8 healthy)
+
+## Clinical Implications
+
+| Finding | Potential Clinical Relevance |
+|---|---|
+| CD177 upregulation | Possible serum biomarker for neutrophil hyperactivation |
+| DEFA1/3 overexpression | Suggests NET formation; supports anti-NET strategies (e.g., DNase, PAD4 inhibitors) |
+| IFI27 / Interferon response | Supports use of IFN-modulating therapies in early COVID-19 |
+| Acute phase signature (HP, SAA) | Consistent with clinical CRP/ferritin elevation in severe cases |
+
+## Limitations
+
+1. **Imbalanced group sizes**: 374 COVID-19 vs. only 8 healthy controls — this imbalance can inflate fold-change estimates and reduce statistical power for detecting downregulated genes.
+2. **Lack of clinical stratification**: All COVID-19 Day 0 patients are pooled regardless of severity (ICU vs. non-ICU). Sub-group analysis could reveal severity-specific signatures.
+3. **Bulk RNA-seq**: Cannot resolve neutrophil subpopulations (low-density vs. mature vs. immature). Single-cell approaches would be more informative.
+4. **No batch correction**: The analysis does not account for potential batch effects across sequencing runs, which may inflate variance in this large dataset.
+
+---
+
+# Conclusion
+
+> **COVID-19 neutrophils at hospital admission exhibit a transcriptional signature dominated by hyperactivation (CD177, DEFA1), interferon response (IFI27), and acute-phase inflammation (HP, TLR5) — consistent with a state of emergency granulopoiesis and NETosis-prone phenotype.**
+
+This signature is biologically coherent with the known immunopathology of severe COVID-19 and identifies several actionable targets for therapeutic intervention.
+
+---
+
+# Session Information
+
+```{r session-info}
+# Ensure full reproducibility: document all package versions
+sessionInfo()
+```
+
+
+
+
